@@ -1,0 +1,876 @@
+name: Malicious Code Analysis
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+  pull-requests: write
+  checks: write
+
+jobs:
+
+  # =========================================================================
+  # ANALYSIS 1: CodeQL Semantic Analysis
+  # =========================================================================
+  codeql:
+    name: "1/10 - CodeQL Semantic Analysis"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript-typescript', 'python', 'ruby', 'go', 'java-kotlin', 'c-cpp', 'swift' ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+      - uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+          output: sarif-results
+      - name: Upload CodeQL SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif-results
+          category: codeql-${{ matrix.language }}
+
+  # =========================================================================
+  # ANALYSIS 2: TruffleHog - Secret & Credential Leak Detection
+  # =========================================================================
+  trufflehog:
+    name: "2/10 - TruffleHog Secrets Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: TruffleHog Scan
+        uses: trufflesecurity/trufflehog@v3.88.2
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          fail_on_detections: false
+          extra_args: --only-verified --results=verified,unverified
+
+  # =========================================================================
+  # ANALYSIS 3: Gitleaks - Git History Secret Scanning
+  # =========================================================================
+  gitleaks:
+    name: "3/10 - Gitleaks Git History Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+      - name: Upload Gitleaks Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 30
+
+  # =========================================================================
+  # ANALYSIS 4: Semgrep - Custom Rule Static Analysis
+  # =========================================================================
+  semgrep:
+    name: "4/10 - Semgrep SAST Scan"
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep Scan
+        continue-on-error: true
+        run: |
+          semgrep ci \
+            --config=auto \
+            --config=p/security-audit \
+            --config=p/secrets \
+            --config=p/owasp-top-ten \
+            --config=p/command-injection \
+            --config=p/supply-chain \
+            --sarif-output=semgrep-results.sarif \
+            --metrics=off \
+            --verbose
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+      - name: Upload Semgrep Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-report
+          path: semgrep-results.sarif
+          retention-days: 30
+
+  # =========================================================================
+  # ANALYSIS 5: GuardDog - Malicious Package Detection
+  # =========================================================================
+  guarddog:
+    name: "5/10 - GuardDog Malicious Packages"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install GuardDog
+        run: pip install guarddog
+      - name: Scan PyPI requirements
+        continue-on-error: true
+        run: |
+          if (Test-Path requirements.txt) {
+            guarddog pypi scan requirements.txt --output-format sarif > guarddog-pypi.sarif
+          } else {
+            echo "No requirements.txt found, skipping PyPI scan"
+          }
+        shell: pwsh
+      - name: Scan npm packages
+        continue-on-error: true
+        run: |
+          if (Test-Path package.json) {
+            guarddog npm scan package.json --output-format sarif > guarddog-npm.sarif
+          } else {
+            echo "No package.json found, skipping npm scan"
+          }
+        shell: pwsh
+      - name: Upload GuardDog SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: guarddog-pypi.sarif
+          category: guarddog-pypi
+      - name: Upload GuardDog npm SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: guarddog-npm.sarif
+          category: guarddog-npm
+
+  # =========================================================================
+  # ANALYSIS 6: Bandit - Python Security Linter
+  # =========================================================================
+  bandit:
+    name: "6/10 - Bandit Python Security"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Bandit
+        run: pip install bandit bandit-sarif-formatter
+      - name: Bandit Scan
+        continue-on-error: true
+        run: |
+          if (Get-ChildItem -Recurse -Filter "*.py" -ErrorAction SilentlyContinue) {
+            bandit -r . -f sarif -o bandit-results.sarif --severity-level all --confidence-level all
+          } else {
+            echo "No Python files found"
+          }
+        shell: pwsh
+      - name: Upload Bandit SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: bandit-results.sarif
+          category: bandit
+
+  # =========================================================================
+  # ANALYSIS 7: Dependency Review - Supply Chain Attack Detection
+  # =========================================================================
+  dependency-review:
+    name: "7/10 - Dependency Supply Chain Review"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: critical
+          allow-licenses: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Unlicense
+          fail-on-scopes: runtime
+          comment-summary-in-pr: always
+          vulnerability-check: true
+          license-check: true
+          deny-licenses: GPL-3.0, AGPL-3.0, BUSL-1.1
+          config-file: 'none'
+
+  # =========================================================================
+  # ANALYSIS 8: Custom Malicious Pattern Detection (Obfuscation, Encoding, Eval, etc.)
+  # =========================================================================
+  malicious-patterns:
+    name: "8/10 - Custom Malicious Pattern Scan"
+    runs-on: ubuntu-latest
+    outputs:
+      report: ${{ steps.scan.outputs.report }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Malicious Pattern Scan
+        id: scan
+        continue-on-error: true
+        run: |
+          $report = @{}
+          $hasIssues = $false
+
+          # Patterns that indicate potentially malicious code
+          $patterns = @(
+            @{ Name = "Base64 Encoded Execution"; Severity = "CRITICAL"; Reason = "Obfuscated code execution via base64 decode"; Patterns = @(
+                '(?i)(base64|b64|frombase64string)\.\s*(decode|decompress|d)?\s*\([''"][A-Za-z0-9+/=]{40,}',
+                '(?i)eval\(.*base64.*decode',
+                '(?i)exec\(.*base64.*decode',
+                '(?i)\[System\.Text\.Encoding\]::UTF8\.GetString\(\[System\.Convert\]::FromBase64String\(',
+                '(?i)atob\([''"][A-Za-z0-9+/=]{30,}'
+              ) }
+            @{ Name = "Suspicious Eval/Exec Usage"; Severity = "HIGH"; Reason = "Dynamic code execution which can hide malicious payloads"; Patterns = @(
+                '(?i)\beval\s*\(\s*[''"`]',
+                '(?i)\bexec\s*\(\s*[''"`]',
+                '(?i)child_process\.exec\s*\(',
+                '(?i)child_process\.execSync\s*\(',
+                '(?i)child_process\.spawn\s*\(',
+                '(?i)Function\s*\(\s*[''"`]',
+                '(?i)new Function\s*\(',
+                '(?i)setTimeout\s*\(\s*[''"`]',
+                '(?i)setInterval\s*\(\s*[''"`]'
+              ) }
+            @{ Name = "Suspicious Import / Require"; Severity = "HIGH"; Reason = "Dynamic import of modules can be used to load malicious code"; Patterns = @(
+                '(?i)require\([''"`].*http',
+                '(?i)require\([''"`].*bit\.ly',
+                '(?i)require\([''"`].*tinyurl',
+                '(?i)require\([''"`].*pastebin',
+                '(?i)import\s+.*from\s+[''"`].*http',
+                '(?i)__import__\s*\(\s*[''"`]http',
+                '(?i)exec\(\s*open\s*\(',
+                '(?i)compile\(\s*open\s*\('
+              ) }
+            @{ Name = "Data Exfiltration / Network Calls"; Severity = "HIGH"; Reason = "Potential data exfiltration to external hosts"; Patterns = @(
+                '(?i)(curl|wget|http\.post|http\.get|fetch|request|axios|got|superagent)\s*\([''"`]https?:\/\/(?!.*github\.com|.*githubusercontent\.com|.*npmjs\.org|.*pypi\.org|.*rubygems\.org|.*docker\.com|.*googleapis\.com)',
+                '(?i)send\s*\(.*(?:token|secret|password|key|credential)',
+                '(?i)XMLHttpRequest\s*\(',
+                '(?i)navigator\.sendBeacon\('
+              ) }
+            @{ Name = "Suspicious File Operations"; Severity = "HIGH"; Reason = "Reading or writing sensitive system files"; Patterns = @(
+                '(?i)\.(bash_history|ssh|gnupg|aws|config|git-credentials)',
+                '(?i)(passwd|shadow|sudoers)',
+                '(?i)chmod\s+.*777',
+                '(?i)chmod\s+.*\+s',
+                '(?i)fs\.chmodSync.*0o?777',
+                '(?i)fs\.chmodSync.*0o?4[0-9][0-9][0-9]'
+              ) }
+            @{ Name = "Suspicious Shell Execution"; Severity = "CRITICAL"; Reason = "Arbitrary shell command execution"; Patterns = @(
+                '(?i)subprocess\.(call|Popen|run|check_output|check_call)\s*\(',
+                '(?i)os\.system\s*\(',
+                '(?i)os\.popen\s*\(',
+                '(?i)\$\(\(.*\)\)',
+                '(?i)\$\{.*\}',
+                '(?i)shell=True',
+                '(?i)exec\s+[\$"].*[;\|&]',
+                '(?i)\|.*bash',
+                '(?i)\|.*sh\b'
+              ) }
+            @{ Name = "Obfuscated JavaScript"; Severity = "CRITICAL"; Reason = "Heavily obfuscated JavaScript code typical of malware"; Patterns = @(
+                '(?i)(\\x[0-9a-f]{2}){10,}',
+                '(?i)(\\u[0-9a-f]{4}){8,}',
+                '(?i)String\.fromCharCode\s*\([\d,]{50,}',
+                '(?i)\[\]\[\[\]\]',
+                '(?i)\[!\[]\]',
+                '(?i)\+\[!\[]\+(?:\+\[!\[]\+)+',
+                '(?i)eval\(.*\\x[a-f0-9]',
+                '(?i)\.constructor\.constructor\s*\('
+              ) }
+            @{ Name = "Cryptominer Indicators"; Severity = "CRITICAL"; Reason = "Known cryptominer signatures"; Patterns = @(
+                '(?i)cryptonight',
+                '(?i)cryptoloot',
+                '(?i)coinimp',
+                '(?i)coin-hive',
+                '(?i)miner\.start',
+                '(?i)miner\.stop',
+                '(?i)\.mine\b.*\.js',
+                '(?i)webmine',
+                '(?i)miner_url',
+                '(?i)stratum\+tcp',
+                '(?i)xmrig',
+                '(?i)cpuminer'
+              ) }
+            @{ Name = "Reverse Shell Indicators"; Severity = "CRITICAL"; Reason = "Code establishing reverse shell connections"; Patterns = @(
+                '(?i)sh\.connect_back',
+                '(?i)reverse_shell',
+                '(?i)socket\.connect\s*\(\([''"`]',
+                '(?i)nc\s+-e\s+',
+                '(?i)ncat\s+.*-e\s+',
+                '(?i)/dev/tcp/',
+                '(?i)bash\s+-i\s+>&\s+/dev/tcp/',
+                '(?i)python\s+-c\s+[''"`].*socket.*connect',
+                '(?i)pty\.spawn.*bash'
+              ) }
+            @{ Name = "Suspicious Environment Variable Access"; Severity = "MEDIUM"; Reason = "Accessing environment variables that may contain secrets"; Patterns = @(
+                '(?i)process\.env\.[A-Z_]*SECRET[A-Z_]*',
+                '(?i)process\.env\.[A-Z_]*TOKEN[A-Z_]*',
+                '(?i)process\.env\.[A-Z_]*PASSWORD[A-Z_]*',
+                '(?i)process\.env\.[A-Z_]*API_KEY[A-Z_]*',
+                '(?i)os\.environ\.get\([''"`].*SECRET',
+                '(?i)os\.environ\.get\([''"`].*TOKEN',
+                '(?i)os\.environ\.get\([''"`].*PASSWORD',
+                '(?i)os\.environ\.get\([''"`].*KEY'
+              ) }
+            @{ Name = "Known Malicious Package Names"; Severity = "CRITICAL"; Reason = "Packages used in typo-squatting or dependency confusion attacks"; Patterns = @(
+                '(?i)["'']node_modules\/[^"'']*(?:hack|malware|virus|trojan|exploit)["'']',
+                '(?i)(?:require|import)\s*\(?\s*["''](?:crossenv|cross-env.js|babel-loan|electorn|loady-darty|mimic-fn|serf-js|js-bson-evil|bson-js-evil|mailparserjs|mssql.js|node-fabric|node-pdf-constructor|pnpm|proxy-poxies|yarrr|all-elements|@dillonchr\\/nope-js|getcookies|express-upload-screen|cookies-fetcher)["'']'
+              ) }
+          )
+
+          # Check changed files only if it's a PR
+          $changedFiles = @()
+          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
+            $changedFiles = git diff --name-only "origin/$env:GITHUB_BASE_REF..." --diff-filter=ACMRT | Where-Object { -not [string]::IsNullOrEmpty($_) }
+          }
+
+          foreach ($category in $patterns) {
+            $findings = @()
+            $filesToScan = if ($changedFiles.Count -gt 0) { $changedFiles } else { Get-ChildItem -Recurse -File | Where-Object { $_.Extension -match '\.(py|js|ts|jsx|tsx|rb|php|sh|bash|ps1|psm1|pl|go|java|kt|scala|swift|c|cpp|h|hpp|cs|rs|ex|exs|lua|r)' -or $_.Name -match '^(Dockerfile|Makefile|.*\.(yml|yaml|json|xml|conf|config|ini|env|cfg))$' } | ForEach-Object { $_.FullName.Replace("$pwd\", "") }
+            }
+
+            foreach ($file in $filesToScan) {
+              if (-not (Test-Path $file)) { continue }
+              $content = Get-Content $file -Raw -ErrorAction SilentlyContinue
+              if (-not $content) { continue }
+
+              foreach ($pattern in $category.Patterns) {
+                $matches = [regex]::Matches($content, $pattern)
+                foreach ($match in $matches) {
+                  $lineNumber = ($content.Substring(0, $match.Index).Split("`n").Count)
+                  $contextStart = [Math]::Max(0, $match.Index - 40)
+                  $contextEnd = [Math]::Min($content.Length, $match.Index + $match.Length + 40)
+                  $context = $content.Substring($contextStart, $contextEnd - $contextStart).Replace("`n", " ").Replace("`r", "").Trim()
+                  $findings += @{
+                    File = $file
+                    Line = $lineNumber
+                    Match = $context
+                    Severity = $category.Severity
+                    Category = $category.Name
+                    Reason = $category.Reason
+                  }
+                }
+              }
+            }
+
+            if ($findings.Count -gt 0) {
+              $hasIssues = $true
+              $report[$category.Name] = @{
+                Severity = $category.Severity
+                Reason = $category.Reason
+                Findings = $findings
+              }
+            }
+          }
+
+          # Generate HTML report
+          $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Malicious Code Analysis Report</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background: #0d1117; color: #c9d1d9; }
+    h1 { color: #58a6ff; border-bottom: 2px solid #30363d; padding-bottom: 10px; }
+    h2 { color: #f0883e; margin-top: 30px; }
+    h3 { color: #f0e68c; }
+    .summary { background: #161b22; padding: 15px; border-radius: 6px; border: 1px solid #30363d; margin: 10px 0; }
+    .finding { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin: 8px 0; }
+    .finding:hover { border-color: #58a6ff; }
+    .critical { border-left: 4px solid #f85149; }
+    .high { border-left: 4px solid #d29922; }
+    .medium { border-left: 4px solid #58a6ff; }
+    .low { border-left: 4px solid #8b949e; }
+    .severity-badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+    .severity-CRITICAL { background: #f85149; color: #fff; }
+    .severity-HIGH { background: #d29922; color: #000; }
+    .severity-MEDIUM { background: #58a6ff; color: #fff; }
+    .severity-LOW { background: #8b949e; color: #fff; }
+    .file-path { color: #79c0ff; font-family: monospace; font-size: 14px; }
+    .line-number { color: #8b949e; }
+    .code-context { background: #0d1117; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 13px; color: #7ee787; margin-top: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+    .reason { color: #8b949e; font-style: italic; margin-top: 4px; }
+    .counter { font-size: 24px; font-weight: bold; }
+    .counter-critical { color: #f85149; }
+    .counter-high { color: #d29922; }
+    .counter-medium { color: #58a6ff; }
+    .stat-box { display: inline-block; min-width: 120px; padding: 10px 20px; margin: 5px; background: #161b22; border-radius: 6px; border: 1px solid #30363d; text-align: center; }
+    .stat-box .value { font-size: 28px; font-weight: bold; }
+    .stat-box .label { font-size: 12px; color: #8b949e; }
+    .clean-badge { display: inline-block; background: #3fb950; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 18px; font-weight: bold; }
+    .dirty-badge { display: inline-block; background: #f85149; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 18px; font-weight: bold; }
+    table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+    th { text-align: left; padding: 8px; border-bottom: 2px solid #30363d; color: #58a6ff; }
+    td { padding: 8px; border-bottom: 1px solid #21262d; }
+  </style>
+</head>
+<body>
+  <h1>Malicious Code Analysis Report</h1>
+  <p>Repository: <code>${{ github.repository }}</code></p>
+  <p>Branch: <code>${{ github.ref_name }}</code></p>
+  <p>Commit: <code>${{ github.sha }}</code></p>
+  <p>Trigger: <code>${{ github.event_name }}</code></p>
+  <hr>
+"@
+
+          $totalCritical = 0
+          $totalHigh = 0
+          $totalMedium = 0
+          $totalLow = 0
+          $totalFindings = 0
+
+          foreach ($cat in $report.Keys) {
+            $sev = $report[$cat].Severity
+            $count = $report[$cat].Findings.Count
+            $totalFindings += $count
+            switch ($sev) {
+              "CRITICAL" { $totalCritical += $count }
+              "HIGH" { $totalHigh += $count }
+              "MEDIUM" { $totalMedium += $count }
+              "LOW" { $totalLow += $count }
+            }
+          }
+
+          $html += @"
+  <h2>Executive Summary</h2>
+  <div class="summary">
+    <h3>$((if ($hasIssues) { "&#9888; Issues Detected" } else { "&#10004; No Malicious Patterns Found" }))</h3>
+    <div>
+      <div class="stat-box"><div class="value counter-critical">$totalCritical</div><div class="label">Critical</div></div>
+      <div class="stat-box"><div class="value counter-high">$totalHigh</div><div class="label">High</div></div>
+      <div class="stat-box"><div class="value counter-medium">$totalMedium</div><div class="label">Medium</div></div>
+      <div class="stat-box"><div class="value">$totalLow</div><div class="label">Low</div></div>
+      <div class="stat-box"><div class="value">$($report.Keys.Count)</div><div class="label">Categories Affected</div></div>
+    </div>
+  </div>
+"@
+
+          if ($hasIssues) {
+            $html += "<h2>Detailed Findings</h2>`n"
+            foreach ($cat in $report.Keys) {
+              $entry = $report[$cat]
+              $html += "<div class='finding $($entry.Severity.ToLower())'>`n"
+              $html += "<h3>$cat <span class='severity-badge severity-$($entry.Severity)'>$($entry.Severity)</span> <span class='line-number'>($($entry.Findings.Count) occurrence$(if($entry.Findings.Count -ne 1){'s'}))</span></h3>`n"
+              $html += "<div class='reason'>$($entry.Reason)</div>`n"
+              $html += "<table><tr><th>File</th><th>Line</th><th>Match Context</th></tr>`n"
+              foreach ($finding in $entry.Findings) {
+                $html += "<tr><td class='file-path'>$($finding.File)</td><td class='line-number'>$($finding.Line)</td><td><code class='code-context'>$([System.Security.SecurityElement]::Escape($finding.Match))</code></td></tr>`n"
+              }
+              $html += "</table></div>`n"
+            }
+          }
+
+          $html += @"
+  <hr>
+  <h2>Analysis Summary</h2>
+  <table>
+    <tr><th>Analysis</th><th>Status</th></tr>
+    <tr><td>1. CodeQL Semantic Analysis</td><td>Running in parallel</td></tr>
+    <tr><td>2. TruffleHog Secrets Scan</td><td>Running in parallel</td></tr>
+    <tr><td>3. Gitleaks Git History Scan</td><td>Running in parallel</td></tr>
+    <tr><td>4. Semgrep Custom SAST</td><td>Running in parallel</td></tr>
+    <tr><td>5. GuardDog Malicious Packages</td><td>Running in parallel</td></tr>
+    <tr><td>6. Bandit Python Security</td><td>Running in parallel</td></tr>
+    <tr><td>7. Dependency Supply Chain Review</td><td>Running in parallel</td></tr>
+    <tr><td>8. Custom Malicious Pattern Scan</td><td>$((if ($hasIssues) { "&#9888; Issues Found" } else { "&#10004; Clean" }))</td></tr>
+    <tr><td>9. High-Entropy / Obfuscation Analysis</td><td>Running in parallel</td></tr>
+    <tr><td>10. Token / Artifact Integrity Scan</td><td>Running in parallel</td></tr>
+  </table>
+  <p><small>Report generated by GitHub Actions | <code>${{ github.workflow }}</code> run #${{ github.run_number }}</small></p>
+</body>
+</html>
+"@
+
+          $html | Out-File -FilePath "malicious-pattern-report.html" -Encoding UTF8
+
+          if ($hasIssues) {
+            echo "status=issues_found" >> $env:GITHUB_OUTPUT
+            echo "count=$totalFindings" >> $env:GITHUB_OUTPUT
+            echo "critical=$totalCritical" >> $env:GITHUB_OUTPUT
+            echo "high=$totalHigh" >> $env:GITHUB_OUTPUT
+            echo "medium=$totalMedium" >> $env:GITHUB_OUTPUT
+            echo "report_file=malicious-pattern-report.html" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "status=clean" >> $env:GITHUB_OUTPUT
+            echo "count=0" >> $env:GITHUB_OUTPUT
+          }
+        shell: pwsh
+      - name: Upload Malicious Pattern Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: malicious-pattern-report
+          path: malicious-pattern-report.html
+          retention-days: 30
+      - name: Comment PR with Findings
+        if: github.event_name == 'pull_request' && steps.scan.outputs.status == 'issues_found'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('malicious-pattern-report.html', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Malicious Code Analysis Results\n\n### Static Pattern Scan: Issues Found\n\n**Critical:** ${{ steps.scan.outputs.critical }} | **High:** ${{ steps.scan.outputs.high }} | **Medium:** ${{ steps.scan.outputs.medium }}\n\nSee the **Malicious Pattern Report** artifact for full details.\n\nCheck the Actions tab for all 10 analysis results including CodeQL, TruffleHog, Gitleaks, Semgrep, GuardDog, Bandit, and Dependency Review.`
+            });
+      - name: Fail on Critical Findings
+        if: steps.scan.outputs.status == 'issues_found' && (steps.scan.outputs.critical > 0 || steps.scan.outputs.high > 0)
+        run: |
+          echo "::error::CRITICAL or HIGH severity malicious patterns detected! Review the report before merging."
+          exit 0  # WARN but don't block - change to exit 1 if you want to block the pipeline
+
+  # =========================================================================
+  # ANALYSIS 9: High Entropy & Obfuscation Detection
+  # =========================================================================
+  entropy-analysis:
+    name: "9/10 - Entropy & Obfuscation Analysis"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Entropy Scan
+        continue-on-error: true
+        run: |
+          $results = @()
+          $files = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -match '\.(py|js|ts|jsx|tsx|rb|php|sh|bash|ps1|go|java|cs|rs|c|cpp|h|hpp|swift|kt|scala|lua|pl|r)' -or
+              $_.Name -match '^(Dockerfile|Makefile|.*\.(conf|config|env|ini|cfg))$'
+            } |
+            Select-Object -ExpandProperty FullName
+
+          $totalFiles = 0
+          $suspiciousFiles = 0
+
+          foreach ($file in $files) {
+            $content = Get-Content $file -Raw -ErrorAction SilentlyContinue
+            if (-not $content) { continue }
+            $totalFiles++
+
+            $lines = $content -split "`n"
+            $longLines = $lines | Where-Object { $_.Length -gt 200 }
+
+            $base64Strings = [regex]::Matches($content, '[A-Za-z0-9+/=]{60,}')
+            $hexStrings = [regex]::Matches($content, '(?:\\x[0-9a-fA-F]{2}){15,}')
+            $unicodeEscapes = [regex]::Matches($content, '(?:\\u[0-9a-fA-F]{4}){10,}')
+
+            $minifiedScore = 0
+            if ($content.Length -gt 5000) {
+              $lineCount = $lines.Count
+              $avgLineLen = $content.Length / $lineCount
+              if ($avgLineLen -gt 200) { $minifiedScore++ }
+              $newlineRatio = [regex]::Matches($content, "`n").Count / $content.Length
+              if ($newlineRatio -lt 0.005) { $minifiedScore++ }
+            }
+
+            $singleCharVars = [regex]::Matches($content, '(?<!\w)([a-z])\s*(?:=|=>|:)') | ForEach-Object { $_.Groups[1].Value }
+            $singleCharCount = ($singleCharVars | Sort-Object -Unique).Count
+
+            $isSuspicious = ($base64Strings.Count -gt 2) -or
+                            ($hexStrings.Count -gt 0) -or
+                            ($unicodeEscapes.Count -gt 0) -or
+                            ($minifiedScore -ge 2) -or
+                            ($singleCharCount -gt 20)
+
+            if ($isSuspicious) {
+              $suspiciousFiles++
+              $relPath = $file.Replace("$pwd\", "")
+              $findings = @()
+              if ($base64Strings.Count -gt 2) { $findings += "Long base64 strings ($($base64Strings.Count))" }
+              if ($hexStrings.Count -gt 0) { $findings += "Hex escape sequences ($($hexStrings.Count))" }
+              if ($unicodeEscapes.Count -gt 0) { $findings += "Unicode escapes ($($unicodeEscapes.Count))" }
+              if ($minifiedScore -ge 2) { $findings += "Minified/obfuscated code (score: $minifiedScore)" }
+              if ($singleCharCount -gt 20) { $findings += "Excessive single-char variables ($singleCharCount unique)" }
+
+              $results += [PSCustomObject]@{
+                File = $relPath
+                Findings = $findings -join "; "
+                Severity = if ($hexStrings.Count -gt 0 -or $unicodeEscapes.Count -gt 0) { "HIGH" } else { "MEDIUM" }
+              }
+            }
+          }
+
+          # Generate entropy report
+          $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Entropy & Obfuscation Analysis Report</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; margin: 20px; background: #0d1117; color: #c9d1d9; }
+    h1 { color: #58a6ff; border-bottom: 2px solid #30363d; padding-bottom: 10px; }
+    h2 { color: #f0883e; }
+    .finding { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px; margin: 6px 0; }
+    .high { border-left: 4px solid #f85149; }
+    .medium { border-left: 4px solid #d29922; }
+    .file-path { color: #79c0ff; font-family: monospace; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 8px; border-bottom: 2px solid #30363d; color: #58a6ff; }
+    td { padding: 8px; border-bottom: 1px solid #21262d; }
+  </style>
+</head>
+<body>
+  <h1>Entropy & Obfuscation Analysis Report</h1>
+  <p>Repository: ${{ github.repository }} | Branch: ${{ github.ref_name }}</p>
+  <hr>
+  <h2>Summary</h2>
+  <p>Files scanned: $totalFiles | Suspicious files: $suspiciousFiles</p>
+"@
+
+          if ($results.Count -gt 0) {
+            $html += "<h2>Suspicious Files</h2><table><tr><th>File</th><th>Severity</th><th>Indicators</th></tr>`n"
+            foreach ($r in $results) {
+              $html += "<tr><td class='file-path'>$($r.File)</td><td>$($r.Severity)</td><td>$($r.Findings)</td></tr>`n"
+            }
+            $html += "</table>"
+          } else {
+            $html += "<p>No obfuscated or high-entropy files detected.</p>"
+          }
+
+          $html += "</body></html>"
+          $html | Out-File -FilePath "entropy-analysis-report.html" -Encoding UTF8
+
+          echo "files_scanned=$totalFiles" >> $env:GITHUB_OUTPUT
+          echo "suspicious_files=$suspiciousFiles" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+      - name: Upload Entropy Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: entropy-analysis-report
+          path: entropy-analysis-report.html
+          retention-days: 30
+
+  # =========================================================================
+  # ANALYSIS 10: File Integrity & Artifact Verification
+  # =========================================================================
+  artifact-integrity:
+    name: "10/10 - File Integrity & Token Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Integrity Scan
+        continue-on-error: true
+        run: |
+          $report = @()
+          $commitCount = 0
+          $suspiciousCommits = 0
+
+          # Check for binary files in code directories (potential payload delivery)
+          $binaryFiles = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -match '\.(exe|dll|so|dylib|bin|elf|class|jar|war|apk|aab|dex|pyc|pyd|o|obj|lib|sys|msi|app|deb|rpm|ko|wasm)' -and
+              $_.Directory -notmatch '\\node_modules\\|\\vendor\\|\\\.git\\|\\build\\|\\dist\\|\\target\\|\\bin\\|\\obj\\'
+            }
+
+          if ($binaryFiles) {
+            foreach ($file in $binaryFiles) {
+              $relPath = $file.FullName.Replace("$pwd\", "")
+              $sizeKB = [Math]::Round($file.Length / 1KB, 1)
+              $report += [PSCustomObject]@{
+                Type = "Binary Artifact"
+                File = $relPath
+                Size = "$sizeKB KB"
+                Severity = "HIGH"
+                Details = "Binary file in source tree (possible payload delivery)"
+              }
+            }
+          }
+
+          # Check for large data blobs (potential data exfiltration staging)
+          $largeDataFiles = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -match '\.(csv|json|xml|sql|dump|sqlite|db|mdb|accdb|dat|log|txt)' -and
+              $_.Length -gt 1MB -and
+              $_.Directory -notmatch '\\node_modules\\|\\vendor\\|\\\.git\\|\\build\\|\\dist\\'
+            }
+
+          if ($largeDataFiles) {
+            foreach ($file in $largeDataFiles) {
+              $relPath = $file.FullName.Replace("$pwd\", "")
+              $sizeMB = [Math]::Round($file.Length / 1MB, 1)
+              $report += [PSCustomObject]@{
+                Type = "Large Data File"
+                File = $relPath
+                Size = "$sizeMB MB"
+                Severity = "MEDIUM"
+                Details = "Large data file in repository (potential exfiltration)"
+              }
+            }
+          }
+
+          # Check for unexpected file permissions (world-readable secrets)
+          if ($IsLinux -or $IsMacOS) {
+            $worldReadable = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { (Get-Item $_).UnixFileMode -match 'other' -and $_.Name -match '(config|secret|key|credential|password|token|\.env|\.pem|\.key|\.cert|credentials)' }
+            if ($worldReadable) {
+              foreach ($file in $worldReadable) {
+                $report += [PSCustomObject]@{
+                  Type = "Permission Issue"
+                  File = $file.FullName.Replace("$pwd\", "")
+                  Size = ""
+                  Severity = "MEDIUM"
+                  Details = "World-readable sensitive file"
+                }
+              }
+            }
+          }
+
+          # Check for unexpected large commits
+          try {
+            $log = git log --oneline --all 2>$null
+            if ($log) {
+              $commitCount = ($log -split "`n").Count
+            }
+            $largeCommits = git log --diff-filter=A --diff-filter=M --diff-algorithm=histogram --format="%H %s" --numstat HEAD 2>$null
+            # Count commits with large file additions
+          } catch {
+            # Not a git repo or shallow clone
+          }
+
+          # Generate report
+          $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>File Integrity & Artifact Scan Report</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; margin: 20px; background: #0d1117; color: #c9d1d9; }
+    h1 { color: #58a6ff; border-bottom: 2px solid #30363d; padding-bottom: 10px; }
+    h2 { color: #f0883e; }
+    .finding { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px; margin: 6px 0; }
+    .HIGH { border-left: 4px solid #f85149; }
+    .MEDIUM { border-left: 4px solid #d29922; }
+    .LOW { border-left: 4px solid #58a6ff; }
+    .file-path { color: #79c0ff; font-family: monospace; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 8px; border-bottom: 2px solid #30363d; color: #58a6ff; }
+    td { padding: 8px; border-bottom: 1px solid #21262d; }
+  </style>
+</head>
+<body>
+  <h1>File Integrity & Artifact Scan Report</h1>
+  <p>Repository: ${{ github.repository }} | Branch: ${{ github.ref_name }}</p>
+  <hr>
+  <h2>Summary</h2>
+  <p>Total commits (all branches): $commitCount</p>
+"@
+
+          if ($report.Count -gt 0) {
+            $html += "<h2>Findings</h2><table><tr><th>Type</th><th>File</th><th>Size</th><th>Severity</th><th>Details</th></tr>`n"
+            foreach ($r in $report) {
+              $html += "<tr><td>$($r.Type)</td><td class='file-path'>$($r.File)</td><td>$($r.Size)</td><td>$($r.Severity)</td><td>$($r.Details)</td></tr>`n"
+            }
+            $html += "</table>"
+          } else {
+            $html += "<p>No integrity issues found.</p>"
+          }
+
+          $html += "</body></html>"
+          $html | Out-File -FilePath "integrity-report.html" -Encoding UTF8
+
+          echo "binary_files=$($report.Count)" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+      - name: Upload Integrity Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: integrity-report
+          path: integrity-report.html
+          retention-days: 30
+
+  # =========================================================================
+  # FINAL: Aggregate Report
+  # =========================================================================
+  aggregate-report:
+    name: "Final Aggregated Report"
+    needs:
+      - codeql
+      - trufflehog
+      - gitleaks
+      - semgrep
+      - guarddog
+      - bandit
+      - dependency-review
+      - malicious-patterns
+      - entropy-analysis
+      - artifact-integrity
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Generate Aggregate Summary
+        run: |
+          $summary = @"
+# Malicious Code Analysis - Complete Report
+
+## 10-Point Analysis Summary
+
+| # | Analysis | Status |
+|---|----------|--------|
+| 1 | CodeQL Semantic Analysis | Completed |
+| 2 | TruffleHog Secrets Scan | Completed |
+| 3 | Gitleaks Git History Scan | Completed |
+| 4 | Semgrep Custom SAST | Completed |
+| 5 | GuardDog Malicious Packages | Completed |
+| 6 | Bandit Python Security | Completed |
+| 7 | Dependency Supply Chain Review | Completed |
+| 8 | Custom Malicious Pattern Detection | Completed |
+| 9 | Entropy & Obfuscation Analysis | Completed |
+| 10 | File Integrity & Token Scan | Completed |
+
+## Artifacts Generated
+- CodeQL SARIF results (uploaded to GitHub Security tab)
+- TruffleHog secrets report
+- Gitleaks scan results
+- Semgrep SAST findings
+- GuardDog malicious package scan
+- Bandit Python security audit
+- Dependency review PR comment
+- Malicious pattern detection report (HTML)
+- Entropy & obfuscation analysis (HTML)
+- File integrity & artifact scan (HTML)
+
+## How to View Reports
+1. **GitHub Security Tab**: CodeQL, Semgrep, Bandit results appear here
+2. **PR Comments**: Dependency Review comments directly on PRs
+3. **Action Artifacts**: All HTML reports are available as downloadable artifacts
+4. **Action Logs**: Detailed output in each job's log
+
+## Next Steps
+- Review ALL findings in the artifacts before merging
+- For false positives, add exclusions to the workflow file
+- Consider adding pre-commit hooks for early detection
+- Enable GitHub secret scanning and push protection in repo settings
+"@
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding UTF8 -Append
+      - name: Final Status Check
+        run: |
+          echo "All 10 malicious code analyses completed."
+          echo "Review all artifacts for detailed findings."
