@@ -1,0 +1,59 @@
+0
+9
+ Key.backspace 
+ Key.backspace 
+ Key.media_volume_mute 
+7
+ Key.media_volume_down 
+3
+6
+4
+8
+3
+7
+4
+6
+g
+g
+e
+r
+g
+f
+l
+i
+w
+h
+f
+l
+i
+u
+y
+r
+9
+8
+3
+4
+8
+y
+n
+o
+8
+4
+y
+5
+8
+7
+4
+m
+x
+3
+r
+o
+3
+7
+x
+4
+r
+t
+ Key.ctrl_l 
+
